@@ -158,6 +158,7 @@ async def call_ollama(image_b64: str, prompt: str, mime_type: str = "image/png")
         "options": {
             "temperature": 0.1,      # bassa temperatura = output più deterministico
             "top_p": 0.9,
+            "num_ctx": 8192,         # contesto esteso — Qwen2.5-VL usa ~4500+ token per le immagini
             "num_predict": 2048,     # sufficiente per JSON complessi
         },
     }

@@ -22,12 +22,6 @@ services:
             - driver: nvidia
               count: 1
               capabilities: [gpu]
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:11434/api/tags"]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-      start_period: 60s
 
   # ─────────────────────────────────────────────
   # Model puller — scarica Qwen2.5-VL al primo avvio
@@ -36,15 +30,15 @@ services:
     image: ollama/ollama:latest
     container_name: visionLLM-puller
     depends_on:
-      ollama:
-        condition: service_healthy
+      - ollama
     volumes:
       - ollama_data:/root/.ollama
     environment:
       - OLLAMA_HOST=http://ollama:11434
     entrypoint: >
       sh -c "
-        echo '>>> Pulling qwen2.5vl:7b (può richiedere qualche minuto al primo avvio)...' &&
+        sleep 5 &&
+        echo '>>> Pulling qwen2.5vl:7b...' &&
         ollama pull qwen2.5vl:7b &&
         echo '>>> Modello pronto.'
       "
@@ -65,8 +59,7 @@ services:
       - OLLAMA_HOST=http://ollama:11434
       - OLLAMA_MODEL=qwen2.5vl:7b
     depends_on:
-      ollama:
-        condition: service_healthy
+      - ollama
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 20s
