@@ -7,6 +7,7 @@ ottimizzati per il contesto videogame (screenshot, asset, UI, sprite).
 """
 
 import base64
+import io
 import json
 import os
 import re
@@ -15,13 +16,21 @@ from typing import Any
 import httpx
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from PIL import Image, UnidentifiedImageError
 
 # ─── Config ───────────────────────────────────────────────────────────────────
 
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5vl:7b")
 OLLAMA_TIMEOUT = 120.0  # secondi — Qwen7B può essere lento su immagini complesse
+OLLAMA_NUM_CTX = int(os.getenv("OLLAMA_NUM_CTX", "8192"))
+
+MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(20 * 1024 * 1024)))
+MAX_IMAGES_PER_REQUEST = int(os.getenv("MAX_IMAGES_PER_REQUEST", "4"))
+MAX_IMAGE_WIDTH = int(os.getenv("MAX_IMAGE_WIDTH", "2048"))
+MAX_IMAGE_HEIGHT = int(os.getenv("MAX_IMAGE_HEIGHT", "2048"))
+MAX_IMAGE_PIXELS = int(os.getenv("MAX_IMAGE_PIXELS", str(4 * 1024 * 1024)))
+MAX_TOTAL_PIXELS_PER_REQUEST = int(os.getenv("MAX_TOTAL_PIXELS_PER_REQUEST", str(8 * 1024 * 1024)))
 
 # ─── App ──────────────────────────────────────────────────────────────────────
 
@@ -108,6 +117,96 @@ def image_to_base64(data: bytes) -> str:
     return base64.b64encode(data).decode("utf-8")
 
 
+def build_analysis_prompt(focus: str | None, image_count: int) -> str:
+    base_prompt = (
+        CUSTOM_ANALYSIS_PROMPT_TEMPLATE.format(focus=focus.strip())
+        if focus
+        else FULL_ANALYSIS_PROMPT
+    )
+
+    if image_count == 1:
+        return base_prompt
+
+    return (
+        base_prompt
+        + f"""
+
+You are given {image_count} related images in the order they were uploaded.
+Analyze them jointly, compare the frames when relevant, and mention changes, continuity, or differences in the scene_summary and agent_notes.
+If the images do not appear related, say so explicitly.
+"""
+    )
+
+
+async def validate_and_encode_image(image: UploadFile) -> tuple[str, str, tuple[int, int]]:
+    allowed_types = {"image/png", "image/jpeg", "image/jpg", "image/webp"}
+    content_type = image.content_type or ""
+    if content_type not in allowed_types:
+        raise HTTPException(
+            status_code=415,
+            detail=f"Tipo file non supportato: {content_type}. Usa PNG, JPG o WebP.",
+        )
+
+    image_data = await image.read()
+    if len(image_data) > MAX_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Immagine troppo grande (max {MAX_UPLOAD_BYTES // (1024 * 1024)}MB).",
+        )
+
+    try:
+        with Image.open(io.BytesIO(image_data)) as img:
+            img.verify()
+        with Image.open(io.BytesIO(image_data)) as img:
+            width, height = img.size
+    except (UnidentifiedImageError, OSError, ValueError):
+        raise HTTPException(status_code=400, detail="File immagine non valido o corrotto.")
+
+    if width > MAX_IMAGE_WIDTH or height > MAX_IMAGE_HEIGHT:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"Immagine troppo grande: {width}x{height}px. "
+                f"Limite massimo: {MAX_IMAGE_WIDTH}x{MAX_IMAGE_HEIGHT}px."
+            ),
+        )
+
+    pixels = width * height
+    if pixels > MAX_IMAGE_PIXELS:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"Immagine troppo pesante per il budget visivo: {pixels} pixel. "
+                f"Limite massimo: {MAX_IMAGE_PIXELS} pixel."
+            ),
+        )
+
+    return image_to_base64(image_data), content_type, (width, height)
+
+
+def validate_request_image_set(images: list[UploadFile]) -> None:
+    if not images:
+        raise HTTPException(status_code=400, detail="Fornisci almeno una immagine.")
+
+    if len(images) > MAX_IMAGES_PER_REQUEST:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Massimo {MAX_IMAGES_PER_REQUEST} immagini per richiesta.",
+        )
+
+
+def validate_total_pixel_budget(dimensions: list[tuple[int, int]]) -> None:
+    total_pixels = sum(width * height for width, height in dimensions)
+    if total_pixels > MAX_TOTAL_PIXELS_PER_REQUEST:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"Budget visivo totale superato: {total_pixels} pixel. "
+                f"Limite massimo per richiesta: {MAX_TOTAL_PIXELS_PER_REQUEST} pixel."
+            ),
+        )
+
+
 def extract_json_from_response(text: str) -> dict[str, Any]:
     """
     Estrae il JSON dalla risposta del modello, gestendo
@@ -164,7 +263,7 @@ def extract_json_from_response(text: str) -> dict[str, Any]:
     }
 
 
-async def call_ollama(image_b64: str, prompt: str, mime_type: str = "image/png") -> str:
+async def call_ollama(image_b64s: list[str], prompt: str) -> str:
     """
     Chiama Ollama con il modello vision e restituisce il testo grezzo.
     """
@@ -173,11 +272,14 @@ async def call_ollama(image_b64: str, prompt: str, mime_type: str = "image/png")
         "prompt": prompt,
         "system": SYSTEM_PROMPT,
         "stream": False,
-        "images": [image_b64],
+        "images": image_b64s,
         "options": {
             "temperature": 0.1,      # bassa temperatura = output più deterministico
             "top_p": 0.9,
-            "num_ctx": 8192,         # contesto esteso — Qwen2.5-VL usa ~4500+ token per le immagini
+            # Qui si gestisce la dimensione del contesto: alzare num_ctx aumenta il budget,
+            # ma cresce anche l'uso di memoria del modello. Con GPU inferenza il KV cache
+            # tende a pesare sulla VRAM; spostarlo solo in RAM non è un toggle trasparente.
+            "num_ctx": OLLAMA_NUM_CTX,
             "num_predict": 2048,     # sufficiente per JSON complessi
         },
     }
@@ -232,7 +334,14 @@ async def health():
 
 @app.post("/analyze")
 async def analyze_image(
-    image: UploadFile = File(..., description="Screenshot o asset da analizzare (PNG, JPG, WebP)"),
+    image: UploadFile | None = File(
+        default=None,
+        description="Singola immagine da analizzare (PNG, JPG, WebP)",
+    ),
+    images: list[UploadFile] | None = File(
+        default=None,
+        description="Una o più immagini da analizzare nello stesso passaggio",
+    ),
     focus: str | None = Form(
         default=None,
         description=(
@@ -250,37 +359,41 @@ async def analyze_image(
     strutturato che descrive tutto il contenuto visivo: scena, UI, testo,
     personaggi, oggetti, ambiente e note per l'agente.
 
-    - **image**: file immagine (multipart/form-data)
+    - **image**: file immagine singolo (multipart/form-data)
+    - **images**: lista di immagini (multipart/form-data, ripetere il campo)
     - **focus**: stringa opzionale per orientare l'analisi su un aspetto specifico
     """
-    # Validazione tipo file
-    allowed_types = {"image/png", "image/jpeg", "image/jpg", "image/webp"}
-    content_type = image.content_type or ""
-    if content_type not in allowed_types:
-        raise HTTPException(
-            status_code=415,
-            detail=f"Tipo file non supportato: {content_type}. Usa PNG, JPG o WebP.",
-        )
+    request_images: list[UploadFile] = []
+    if image is not None:
+        request_images.append(image)
+    if images:
+        request_images.extend(images)
 
-    image_data = await image.read()
-    if len(image_data) > 20 * 1024 * 1024:  # 20MB limit
-        raise HTTPException(status_code=413, detail="Immagine troppo grande (max 20MB).")
+    validate_request_image_set(request_images)
 
-    image_b64 = image_to_base64(image_data)
+    encoded_images: list[str] = []
+    dimensions: list[tuple[int, int]] = []
+    content_types: list[str] = []
 
-    # Scegli il prompt in base al focus
-    if focus:
-        prompt = CUSTOM_ANALYSIS_PROMPT_TEMPLATE.format(focus=focus.strip())
-    else:
-        prompt = FULL_ANALYSIS_PROMPT
+    for upload in request_images:
+        image_b64, content_type, size = await validate_and_encode_image(upload)
+        encoded_images.append(image_b64)
+        content_types.append(content_type)
+        dimensions.append(size)
 
-    raw = await call_ollama(image_b64, prompt, mime_type=content_type)
+    validate_total_pixel_budget(dimensions)
+
+    prompt = build_analysis_prompt(focus, len(encoded_images))
+
+    raw = await call_ollama(encoded_images, prompt)
     result = extract_json_from_response(raw)
 
     return JSONResponse(
         content={
             "model": OLLAMA_MODEL,
             "focus": focus,
+            "image_count": len(encoded_images),
+            "content_types": content_types,
             "result": result,
         }
     )
@@ -301,14 +414,9 @@ async def analyze_batch(
 
     results = []
     for img in images:
-        image_data = await img.read()
-        image_b64 = image_to_base64(image_data)
-        prompt = (
-            CUSTOM_ANALYSIS_PROMPT_TEMPLATE.format(focus=focus.strip())
-            if focus
-            else FULL_ANALYSIS_PROMPT
-        )
-        raw = await call_ollama(image_b64, prompt)
+        image_b64, _, _ = await validate_and_encode_image(img)
+        prompt = build_analysis_prompt(focus, 1)
+        raw = await call_ollama([image_b64], prompt)
         results.append({
             "filename": img.filename,
             "result": extract_json_from_response(raw),
@@ -323,7 +431,7 @@ async def root():
         "service": "Game Vision API",
         "model": OLLAMA_MODEL,
         "endpoints": {
-            "POST /analyze": "Analisi singola immagine con focus opzionale",
+            "POST /analyze": "Analisi una o più immagini con focus opzionale",
             "POST /analyze/batch": "Analisi batch (max 10 immagini)",
             "GET /health": "Stato del servizio e del modello",
             "GET /docs": "Swagger UI interattiva",

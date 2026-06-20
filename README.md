@@ -44,6 +44,15 @@ curl -X POST http://localhost:8000/analyze \
   -F "image=@screenshot.png"
 ```
 
+L'endpoint accetta anche più immagini nello stesso passaggio usando il campo `images` ripetuto. Il servizio valida subito numero di file, dimensioni e budget totale prima di chiamare Qwen.
+
+```bash
+curl -X POST http://localhost:8000/analyze \
+  -F "images=@frame1.png" \
+  -F "images=@frame2.png" \
+  -F "images=@frame3.png"
+```
+
 **Risposta:**
 ```json
 {
@@ -174,9 +183,12 @@ print(actions)
 |---|---|
 | VRAM usage | ~5-6GB con Qwen2.5-VL 7B Q4 |
 | Latenza tipica | 5-15s per immagine (dipende da complessità) |
+| Contesto | `OLLAMA_NUM_CTX` regola il budget contesto; aumentarlo aumenta anche la memoria richiesta |
 | Modello persistente | `OLLAMA_KEEP_ALIVE=24h` — non viene scaricato dalla VRAM |
 | Concorrenza | `NUM_PARALLEL=1` — una richiesta alla volta (safe per 8GB) |
 | Modelli dati | Volume Docker `game-vision-ollama-data` — il modello non si riscarica ai restart |
+
+Nota sul contesto: con Ollama/Qwen il budget di contesto si controlla tramite `num_ctx`. Se aumenti il valore, cresce il consumo di memoria del modello. In pratica non c'è un interruttore semplice per "spostare solo in RAM" il contesto e lasciare invariata la VRAM: con inferenza GPU il KV cache tende comunque a gravare sulla VRAM. La strada più sicura è ridurre il numero di immagini, la risoluzione o usare un modello più piccolo.
 
 ---
 
