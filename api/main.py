@@ -121,21 +121,40 @@ def extract_json_from_response(text: str) -> dict[str, Any]:
     except json.JSONDecodeError:
         pass
 
-    # Caso: il modello ha wrappato in ```json ... ```
+    def repair_agent_notes(s: str) -> str:
+        """Ripara agent_notes se il modello lo restituisce come dict invece di stringa."""
+        return re.sub(
+            r'"agent_notes"\s*:\s*\{[^}]*\}',
+            lambda m: '"agent_notes": ' + json.dumps(
+                " ".join(re.findall(r'"([^"]+)"', m.group(0))[1:])
+            ),
+            s,
+        )
+
+    # Caso: il modello ha wrappato in ```json ... ``` o ``` ... ```
     match = re.search(r"```(?:json)?\s*([\s\S]*?)```", text)
     if match:
+        candidate = match.group(1).strip()
         try:
-            return json.loads(match.group(1).strip())
+            return json.loads(candidate)
         except json.JSONDecodeError:
-            pass
+            try:
+                return json.loads(repair_agent_notes(candidate))
+            except json.JSONDecodeError:
+                pass
 
-    # Fallback: cerca il primo { ... } valido
-    match = re.search(r"\{[\s\S]*\}", text)
-    if match:
+    # Fallback: cerca il blocco { ... } più esterno (first { → last })
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        candidate = text[start:end + 1]
         try:
-            return json.loads(match.group(0))
+            return json.loads(candidate)
         except json.JSONDecodeError:
-            pass
+            try:
+                return json.loads(repair_agent_notes(candidate))
+            except json.JSONDecodeError:
+                pass
 
     # Se tutto fallisce, ritorna un oggetto di errore con il testo raw
     return {
